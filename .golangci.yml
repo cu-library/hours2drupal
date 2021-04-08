@@ -20,5 +20,9 @@ linters:
     - wastedassign
     - whitespace
     - wsl
+linters-settings:
+  godot:
+    scope: all
+    capital: true
 issues:
   fix: true
