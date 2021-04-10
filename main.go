@@ -30,8 +30,10 @@ const (
 	ProjectName = "hours2drupal"
 	// Version  is the version number, which should be overwritten when building using ldflags.
 	Version = "devel"
-	// HoursPostPath is the path to append to the target to build the full URL for POSTing JSON data.
-	HoursPostPath = "/jsonapi/node/hours"
+	// HoursPath is the path to append to the target to build the full URL for Hours nodes.
+	HoursPath = "/jsonapi/node/hours"
+	// HoursByDayPath is the path to append to the target to build the full URL for hours_by_day paragraphs.
+	HoursByDayPath = "/jsonapi/paragraph/hours_by_day"
 	// RequestTimeout is the amount of time the tool will wait for API calls to complete before they are cancelled.
 	RequestTimeout = 60 * time.Second
 	// AcceptHeader is the MIME type Drupal's JSON API expects to see in the Accept header of POST requests.
@@ -43,49 +45,64 @@ const (
 // ErrNoHeader is an error which is returned when a CSV file doesn't have a header line.
 var ErrNoHeader = errors.New("csv file did not have a header")
 
+// ErrMissingData is an error which is returned when a CSV file has missing fields.
+var ErrMissingData = errors.New("missing data")
+
 // ErrAPIError is an error which is returned when the Drupal API returns an unexpected error.
 var ErrAPIError = errors.New("an API error occurred")
 
-// HoursNode is the struct compliment of the required JSON.
-type HoursNode struct {
+// HoursByDayParagraph is the struct compliment of the required JSON for an hours by day paragraph.
+type HoursByDayParagraph struct {
 	Data struct {
 		Type       string `json:"type"`
+		ID         string `json:"id,omitempty"`
 		Attributes struct {
-			Title string `json:"title"`
-			Date  string `json:"field_for_date"`
-			Hours string `json:"field_hours_building_hours"`
-			Note  string `json:"field_hours_note"`
+			DrupalInternalID         int    `json:"drupal_internal__id,omitempty"`
+			DrupalInternalRevisionID int    `json:"drupal_internal__revision_id,omitempty"`
+			ParentID                 string `json:"parent_id"`
+			ParentType               string `json:"parent_type"`
+			ParentFieldName          string `json:"parent_field_name"`
+			BuildingHours            string `json:"field_building_hours"`
+			ChatHours                string `json:"field_chat_hours"`
+			Day                      string `json:"field_day"`
+			Note                     string `json:"field_note"`
 		} `json:"attributes"`
 	} `json:"data"`
 }
 
-// NewHoursNode creates a new HoursNode struct.
-func NewHoursNode(title, date, hours, note string) HoursNode {
-	n := HoursNode{}
-	n.Data.Type = "node--hours"
-	n.Data.Attributes.Title = strings.TrimSpace(title)
-	n.Data.Attributes.Date = strings.TrimSpace(date)
-	n.Data.Attributes.Hours = strings.TrimSpace(hours)
-	n.Data.Attributes.Note = strings.TrimSpace(note)
+// NewHoursByDayParagraph creates a new NewHoursByDayParagraph struct.
+func NewHoursByDayParagraph(parentID, buildingHours, chatHours, day, note string) HoursByDayParagraph {
+	p := HoursByDayParagraph{}
+	p.Data.Type = "paragraph--hours_by_day"
+	p.Data.Attributes.ParentID = parentID
+	p.Data.Attributes.ParentType = "node"
+	p.Data.Attributes.ParentFieldName = "field_day"
+	p.Data.Attributes.BuildingHours = strings.TrimSpace(buildingHours)
+	p.Data.Attributes.ChatHours = strings.TrimSpace(chatHours)
+	p.Data.Attributes.Day = strings.TrimSpace(day)
+	p.Data.Attributes.Note = strings.TrimSpace(note)
 
-	return n
+	return p
 }
 
-// Post uses the JSON API endpoint at target to create the new node.
-func (n HoursNode) Post(ctx context.Context, target, username, password string) error {
+// Post uses the JSON API endpoint at target to create the new paragraph.
+func (p *HoursByDayParagraph) Post(ctx context.Context, target, username, password string) error {
+	url := fmt.Sprintf("https://%v%v", target, HoursByDayPath)
+	return p.doAPICall(ctx, url, http.MethodPost, username, password)
+}
+
+// doAPICall calls the API using the provided method.
+func (p *HoursByDayParagraph) doAPICall(ctx context.Context, url, method, username, password string) error {
 	// Create a new context from the base context with a timeout.
 	ctx, cancel := context.WithTimeout(ctx, RequestTimeout)
 	defer cancel()
 
-	// Build the URL.
-	url := fmt.Sprintf("https://%v%v", target, HoursPostPath)
-
-	b, err := json.Marshal(n)
+	b, err := json.Marshal(p)
 	if err != nil {
 		return err
 	}
 
-	r, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(b))
+	r, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(b))
 	if err != nil {
 		return err
 	}
@@ -101,10 +118,14 @@ func (n HoursNode) Post(ctx context.Context, target, username, password string) 
 		return err
 	}
 
-	// If the response is 201, return early.
-	if resp.StatusCode == http.StatusCreated {
-		// Drain and close the body.
-		_, err = io.Copy(io.Discard, resp.Body)
+	// If the response is 200 or 201, update the node.
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
+		rb, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return err
+		}
+
+		err = json.Unmarshal(rb, p)
 		if err != nil {
 			return err
 		}
@@ -130,6 +151,133 @@ func (n HoursNode) Post(ctx context.Context, target, username, password string) 
 	}
 
 	return fmt.Errorf("%w: %v %v failed [%v]\n%v", ErrAPIError, r.Method, r.URL.String(), resp.StatusCode, string(body))
+}
+
+// HoursNode is the struct compliment of the required JSON for an hours node.
+type HoursNode struct {
+	Data struct {
+		Type       string `json:"type"`
+		ID         string `json:"id,omitempty"`
+		Attributes struct {
+			Title string `json:"title"`
+		} `json:"attributes"`
+		Relationships struct {
+			FieldDay struct {
+				Data []ParagraphRelationship `json:"data"`
+			} `json:"field_day"`
+		} `json:"relationships,omitempty"`
+	} `json:"data"`
+}
+
+// ParagraphRelationship contains the data linking the node to the paragraph.
+type ParagraphRelationship struct {
+	Type string `json:"type"`
+	ID   string `json:"id"`
+	Meta struct {
+		TargetRevisionID int `json:"target_revision_id"`
+	} `json:"meta"`
+}
+
+// NewHoursNode creates a new HoursNode struct.
+func NewHoursNode(title string) HoursNode {
+	n := HoursNode{}
+	n.Data.Type = "node--hours"
+	n.Data.Attributes.Title = strings.TrimSpace(title)
+
+	return n
+}
+
+// NewParagraphRelationship creates a new ParagraphRelationship.
+func NewParagraphRelationship(pType, pID string, targetRevisionID int) ParagraphRelationship {
+	p := ParagraphRelationship{}
+	p.Type = pType
+	p.ID = pID
+	p.Meta.TargetRevisionID = targetRevisionID
+
+	return p
+}
+
+// Post uses the JSON API endpoint at target to create the new node.
+func (n *HoursNode) Post(ctx context.Context, target, username, password string) error {
+	url := fmt.Sprintf("https://%v%v", target, HoursPath)
+	return n.doAPICall(ctx, url, http.MethodPost, username, password)
+}
+
+// Patch uses the JSON API endpoint at target to update the new node.
+func (n *HoursNode) Patch(ctx context.Context, target, username, password string) error {
+	url := fmt.Sprintf("https://%v%v/%v", target, HoursPath, n.Data.ID)
+	return n.doAPICall(ctx, url, http.MethodPatch, username, password)
+}
+
+// doAPICall calls the API using the provided method.
+func (n *HoursNode) doAPICall(ctx context.Context, url, method, username, password string) error {
+	// Create a new context from the base context with a timeout.
+	ctx, cancel := context.WithTimeout(ctx, RequestTimeout)
+	defer cancel()
+
+	b, err := json.Marshal(n)
+	if err != nil {
+		return err
+	}
+
+	r, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(b))
+	if err != nil {
+		return err
+	}
+
+	// Set the required headers.
+	r.Header.Set("Accept", AcceptHeader)
+	r.Header.Set("Content-Type", ContentTypeHeader)
+	r.SetBasicAuth(username, password)
+
+	// Do the POST request.
+	resp, err := http.DefaultClient.Do(r)
+	if err != nil {
+		return err
+	}
+
+	// If the response is 200 or 201, update the node.
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
+		rb, err := io.ReadAll(resp.Body)
+
+		if err != nil {
+			return err
+		}
+
+		err = json.Unmarshal(rb, n)
+		if err != nil {
+			return err
+		}
+
+		err = resp.Body.Close()
+		if err != nil {
+			return err
+		}
+
+		return nil
+	}
+
+	// Some error occurred, return more details to the caller.
+	body, err := io.ReadAll(resp.Body)
+
+	if err != nil {
+		return err
+	}
+
+	err = resp.Body.Close()
+	if err != nil {
+		return err
+	}
+
+	return fmt.Errorf("%w: %v %v failed [%v]\n%v", ErrAPIError, r.Method, r.URL.String(), resp.StatusCode, string(body))
+}
+
+// DailyHours stores the data from the CSV file, the source data for the Drupal paragraphs.
+type DailyHours struct {
+	Day           time.Time
+	Note          string
+	BuildingHours string
+	ChatHours     string
 }
 
 func main() {
@@ -171,7 +319,7 @@ func main() {
 		log.Fatalln("Please provide at least one CSV file as an argument.")
 	}
 
-	fmt.Printf("Going to import hours into 'https://%v%v'.\n", *target, HoursPostPath)
+	fmt.Printf("Going to import hours into 'https://%v'.\n", *target)
 	fmt.Printf("Using username '%v'.\n", *username)
 
 	// Read password for username.
@@ -195,31 +343,74 @@ func main() {
 
 // process creates a context and processes the arguments.
 func process(args []string, target, username, password string) error {
-	// Create a base context which can be cancelled by a SIGINT signal.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
+	hours := []DailyHours{}
 
-	// Process input CSV files.
+	// Load input from CSV files.
 	for _, arg := range args {
-		// Has our context been cancelled?
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-
-		err := processCSV(ctx, arg, target, username, password)
+		h, err := loadFromCSV(arg)
 		if err != nil {
 			return fmt.Errorf("processing CSV file '%v' failed, %w", arg, err)
 		}
+
+		hours = append(hours, h...)
+	}
+
+	// Partition the days by month.
+	months := map[string][]DailyHours{}
+
+	for _, h := range hours {
+		monthAndYear := h.Day.Format("January, 2006")
+		months[monthAndYear] = append(months[monthAndYear], h)
+	}
+
+	// Create a context which can be cancelled by a SIGINT signal.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	// For every month, we create the 'container' node, then the containing paragraphs
+	// which are then patched in.
+	for month, dailyHours := range months {
+		fmt.Printf("%v...", month)
+		n := NewHoursNode(month)
+
+		err := n.Post(ctx, target, username, password)
+		if err != nil {
+			return err
+		}
+
+		for _, h := range dailyHours {
+			// Has our context been cancelled?
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+
+			p := NewHoursByDayParagraph(n.Data.ID, h.BuildingHours, h.ChatHours, h.Day.Format("2006-01-02"), h.Note)
+
+			err := p.Post(ctx, target, username, password)
+			if err != nil {
+				return err
+			}
+
+			r := NewParagraphRelationship(p.Data.Type, p.Data.ID, p.Data.Attributes.DrupalInternalRevisionID)
+			n.Data.Relationships.FieldDay.Data = append(n.Data.Relationships.FieldDay.Data, r)
+
+			err = n.Patch(ctx, target, username, password)
+			if err != nil {
+				return err
+			}
+		}
+
+		fmt.Println(" Success")
 	}
 
 	return nil
 }
 
-// processCSV processes one of the provided hours CSV files.
-func processCSV(ctx context.Context, arg, target, username, password string) error {
+// loadFromCSV processes one of the provided hours CSV files.
+func loadFromCSV(arg string) (hours []DailyHours, err error) {
 	f, err := os.Open(arg)
 	if err != nil {
-		return err
+		return hours, err
 	}
 
 	r := csv.NewReader(f)
@@ -230,11 +421,11 @@ func processCSV(ctx context.Context, arg, target, username, password string) err
 	// If the first line doesn't exist, return the header error.
 	l, err := r.Read()
 	if errors.Is(err, io.EOF) {
-		return ErrNoHeader
+		return hours, ErrNoHeader
 	}
 
 	if err != nil {
-		return err
+		return hours, err
 	}
 
 	// Build the column name map from the header line.
@@ -242,40 +433,56 @@ func processCSV(ctx context.Context, arg, target, username, password string) err
 		h[strings.TrimSpace(header)] = i
 	}
 
+	// Keep track of the line number for error reporting.
+	lineNum := 1
+
 	for {
-		// Has our context been cancelled?
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
+		lineNum++
 
 		l, err := r.Read()
+
 		if errors.Is(err, io.EOF) {
 			break
 		}
 
 		if err != nil {
-			return err
+			return hours, err
 		}
 
-		n := NewHoursNode(l[h["title"]], l[h["date"]], l[h["hours"]], l[h["note"]])
+		// Pull the data from the line using the header map, trimming leading and trailing space.
+		note := strings.TrimSpace(l[h["note"]])
+		buildingHours := strings.TrimSpace(l[h["building hours"]])
+		chatHours := strings.TrimSpace(l[h["chat hours"]])
 
-		fmt.Printf("%v... ", l[h["title"]])
+		day := strings.TrimSpace(l[h["day"]])
+		if day == "" {
+			return hours, fmt.Errorf("%w: empty day on line %v", ErrMissingData, lineNum)
+		}
 
-		err = n.Post(ctx, target, username, password)
+		// Parse the day into a Time so we can more easily process it later.
+		// The reference time is documented here: https://golang.org/pkg/time/#Parse
+		parsedDay, err := time.Parse("2006-01-02", day)
 		if err != nil {
-			fmt.Printf("Error\n")
-			return err
+			return hours, fmt.Errorf("Could not parse day on line %v: %w", lineNum, err)
 		}
 
-		fmt.Printf("Success\n")
-
-		// Wait to not overwhelm server.
-		select {
-		case <-time.After(250 * time.Millisecond):
-		case <-ctx.Done():
-			return ctx.Err()
+		if buildingHours == "" {
+			return hours, fmt.Errorf("%w: empty building hours on line %v", ErrMissingData, lineNum)
 		}
+
+		if chatHours == "" {
+			return hours, fmt.Errorf("%w: empty chat hours on line %v", ErrMissingData, lineNum)
+		}
+
+		n := DailyHours{
+			Day:           parsedDay,
+			Note:          note,
+			BuildingHours: buildingHours,
+			ChatHours:     chatHours,
+		}
+
+		hours = append(hours, n)
 	}
 
-	return nil
+	return hours, nil
 }
